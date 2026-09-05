@@ -1,12 +1,12 @@
 # Vault
 
-Turbin3 Q3 2026, week 2. Two programs in one workspace:
+Week 2 for Turbin3. Two programs in here:
 
-- **`programs/vault`** — a SOL vault. Deposit, withdraw, close. This is the assignment.
-- **`programs/nc-vault`** — a non-custodial token vault where you can always get out,
-  even when the vault has no cash left. This is the advanced extension challenge.
+- `programs/vault` is the SOL vault the assignment asked for. Deposit, withdraw, close.
+- `programs/nc-vault` is the advanced extension. A token vault you can always get out
+  of, even when there's no cash left in it.
 
-## Run it
+## Running it
 
 ```bash
 pnpm install
@@ -14,92 +14,86 @@ anchor build
 anchor test --validator legacy
 ```
 
-`--validator legacy` matters. Anchor 1.0 defaults to Surfpool, and if you don't have
-Surfpool installed the run dies with `Failed to spawn 'surfpool'`. The flag tells it to
-use `solana-test-validator` instead.
+You need `--validator legacy`. Anchor 1.0 goes for Surfpool by default and I don't have
+Surfpool installed, so without the flag it just dies with `Failed to spawn 'surfpool'`.
+Took me way too long to work out that's all it was.
 
-15 tests, all passing. Screenshot is in `screenshots/`.
+15 tests pass. Screenshot is in `screenshots/`.
 
 ---
 
-## Part 1: the SOL vault
+## The SOL vault
 
-Two PDAs per user:
+Every user gets two PDAs. `vault_state` at `["state", user]` holds two bumps and that's
+it. `vault` at `["vault", vault_state]` is a `SystemAccount` that sits there holding
+lamports. It never stores data so there's nothing to deserialize, which is why it's a
+`SystemAccount` and not an `Account`.
 
-| PDA | Seeds | What it is |
-|-----|-------|------------|
-| `vault_state` | `["state", user]` | Tiny account holding the two bumps |
-| `vault` | `["vault", vault_state]` | A `SystemAccount` that just holds lamports |
+Four instructions:
 
-The holding account is a `SystemAccount`, not an `Account`. It never stores data, only
-lamports, so there's nothing to deserialize.
+- `initialize` makes the state account and saves both bumps on it
+- `deposit` sends lamports in
+- `withdraw` sends them back, signed by the vault PDA
+- `close` empties the vault and closes the state account
 
-### Instructions
+### No has_one, on purpose
 
-| Instruction | What it does |
-|---|---|
-| `initialize` | Creates `vault_state`, caches both bumps on it |
-| `deposit(amount)` | User sends lamports to the vault |
-| `withdraw(amount)` | Vault sends lamports back, signed by the vault PDA |
-| `close` | Empties the vault and closes `vault_state` |
+Most vault examples save the owner on the state account and check it with `has_one`.
+I didn't do that.
 
-### Why there's no `has_one = owner`
+The seeds are `["state", user.key()]` and `user` is the signer. Anchor rederives that
+address from whoever signed and compares. So if somebody signs with their own key and
+passes my `vault_state`, the address doesn't match and it fails before my code even
+runs. Storing a 32 byte owner and checking it a second time doesn't stop anything the
+seeds aren't already stopping. There's a test where an attacker tries exactly this.
 
-Most vault tutorials store the owner on the state account and check it with `has_one`.
-This one doesn't, and it's on purpose.
+### The rent thing
 
-The seeds are `["state", user.key()]` where `user` is the signer. Anchor re-derives that
-address from whoever signed and compares. If an attacker signs and passes someone else's
-`vault_state`, the derivation doesn't match and the constraint fails before the handler
-runs. Storing a 32 byte owner field and checking it a second time protects against
-nothing extra, so it's not there. There's a test for this.
-
-### The rent boundary
-
-A system account can't drop below the rent-exempt minimum. If it does the transfer fails
-with a runtime error that tells you nothing useful, so the program checks first:
+System accounts can't drop below rent exempt. If you try, the transfer fails with a
+runtime error that tells you nothing useful. So I check first:
 
 ```rust
 let min = Rent::get()?.minimum_balance(0);
 require!(self.vault.lamports().saturating_sub(amount) >= min, VaultError::InsufficientFunds);
 ```
 
-**The comparison is `>=`.** Landing on exactly the rent-exempt minimum is fine. One
-lamport under is not. Both are tested.
+It's `>=`, so landing on exactly the rent exempt minimum is fine and one lamport under
+isn't. Both are tested.
 
-`saturating_sub` instead of plain `-` because the release profile has `overflow-checks = true`,
-so subtracting more than the balance would panic instead of returning a clean error.
+`saturating_sub` instead of plain subtraction because the release profile has overflow
+checks on, so `lamports() - amount` would panic instead of giving back my error.
 
 ---
 
-## Part 2: the non-custodial vault
+## The non-custodial vault
 
-### The idea in one paragraph
+### What it actually does
 
-The vault holds two token accounts: **cash** (the underlying token) and a **position**
-token. You deposit cash and get **share tokens** back, priced against the total of both
-accounts. To leave, you burn shares and the program hands you your exact percentage of
-*each* account. If the manager has moved all the cash into the position, you get position
-tokens instead of cash and your withdrawal still goes through. There is no instruction
-that lets the manager send assets to themselves, no pause switch, and no lockup. That's
-what makes it non-custodial and exit-anytime.
+The vault holds two token accounts. One is cash, the other is a position token. You put
+cash in and get share tokens back, priced against both accounts added together. When you
+want out you burn shares and the program hands you your percentage of each account.
 
-### What the position token is
+The interesting part is what happens when there's no cash. If the manager moved it all
+into the position, you get position tokens instead and your withdrawal still goes
+through. There's no instruction that lets the manager send anything to themselves, no
+pause button, no lockup. That's the non-custodial bit.
 
-One position token means one unit of underlying that has been put to work in some market.
-It's a stand-in for an LP token or a market receipt. Defining it at par like that buys
-three things:
+### The position token
 
-1. **No oracle needed.** `total_assets = cash_balance + position_balance`. Exact, always.
-2. **`invest` can't be a rug.** It takes one `amount` and uses it for both legs, so an
-   uneven swap isn't something you can even express in the instruction.
-3. **Testing "no liquidity" is one call.** `invest(everything)` and the cash account is zero.
+One position token means one unit of underlying that's been put to work somewhere. It's
+standing in for an LP token. I defined it at par on purpose because it makes three
+things easy:
 
-### Accounts
+- total assets is just cash + position, so no oracle
+- `invest` takes one amount and uses it for both legs, so you can't even write a call
+  that swaps unevenly
+- getting to zero liquidity in a test is one `invest(everything)`
+
+### State
 
 ```rust
 pub struct Vault {
-    pub manager: Pubkey,          // can call invest/divest, and nothing else
+    pub manager: Pubkey,
     pub underlying_mint: Pubkey,
     pub position_mint: Pubkey,
     pub shares_mint: Pubkey,
@@ -107,136 +101,102 @@ pub struct Vault {
 }
 ```
 
-That's the whole state. Everything else is derived and checked by constraints:
+That's all of it. The vault is at `["vault", manager, underlying_mint]`, the shares mint
+is at `["shares", vault]` with the vault PDA as its mint authority, and the two token
+accounts are just ATAs the vault owns.
 
-| Account | Seeds / derivation |
-|---|---|
-| `vault` | `["vault", manager, underlying_mint]` |
-| `shares_mint` | `["shares", vault]`, mint authority is the vault PDA |
-| `vault_underlying` | ATA of `underlying_mint`, owned by the vault |
-| `vault_position` | ATA of `position_mint`, owned by the vault |
+Instructions are `initialize`, `deposit`, `withdraw`, `invest`, `divest`. The manager can
+only call invest and divest.
 
-### Instructions
+### The math
 
-| Instruction | What it does |
-|---|---|
-| `initialize` | Creates the config, the shares mint, and the vault's two token accounts |
-| `deposit(amount)` | Takes your cash, mints you shares pro rata |
-| `withdraw(shares)` | Burns your shares, pays you a slice of **both** accounts |
-| `invest(amount)` | Manager swaps cash out for position tokens, 1:1 |
-| `divest(amount)` | The other direction |
-
-### Share math
-
-On deposit:
+Deposit:
 
 ```
-shares = amount * supply / total_assets      (or just `amount` if supply is 0)
+shares = amount * supply / total_assets      (or just amount if supply is 0)
 ```
 
-The balances get read before the incoming transfer lands, so `total_assets` is the
-pre-deposit number. The code does the math first and transfers second for exactly that
-reason.
+I read the balances before the transfer goes through, so `total_assets` is the number
+from before your deposit landed. That's the reason the math happens first and the
+transfer second, not the other way round.
 
-On withdraw, both payouts come off the pre-burn supply:
+Withdraw, both worked out off the supply before the burn:
 
 ```
-underlying_out = cash_balance     * shares / supply
-position_out   = position_balance * shares / supply
+underlying_out = cash     * shares / supply
+position_out   = position * shares / supply
 ```
 
-**`transfer_checked` with an amount of 0 is legal.** That's the trick that makes the
-zero-liquidity exit work with no special case. If the cash account is empty, that leg
-transfers 0 and the position leg pays out everything you're owed. Same code path either way.
+Here's the thing that makes the empty vault case work: `transfer_checked` with an amount
+of 0 is legal. So if there's no cash, that leg moves 0 and the position leg pays you
+everything you're owed. Same code either way, no if statement, no special case.
 
 ### Rounding
 
-All three divisions truncate. Every one of them rounds **against whoever is acting** and
-in favor of everyone still in the pool:
+All three divisions truncate and they all round against whoever's calling. A depositor
+gets slightly fewer shares, a withdrawer gets slightly less of each asset, and the
+leftover stays with everyone still in the pool. If it rounded the other way you could
+drain the thing with a loop of tiny deposits and withdrawals.
 
-- Depositor gets fewer shares, the remainder accrues to existing holders.
-- Withdrawer gets slightly less of each asset, the dust stays.
+If you're the only one in, `shares == supply`, so `balance * supply / supply` is exact
+and you get all of it back. That's a test.
 
-A vault that rounded the other way could be drained by looping tiny deposits and
-withdrawals. One clean case: if you're the only depositor, `shares == supply`, so
-`balance * supply / supply` is exact and you get everything back. That's tested.
+### The first depositor attack
 
-### The first-depositor attack, and why it's only half fixed
+Somebody deposits 1 unit so supply is 1, then sends a big pile of tokens straight to the
+vault's token account. Anyone can do that, no instruction needed. Now total assets is
+huge, and the next person's `amount * 1 / total_assets` rounds down to 0 shares. They'd
+hand over real tokens and get nothing back.
 
-An attacker deposits 1 unit so `supply == 1`, then sends a big pile of tokens straight
-into the vault's token account. Anyone can do that, no instruction required. Now
-`total_assets` is huge, and the next person's `amount * 1 / total_assets` truncates to 0
-shares. They'd hand over real tokens and get nothing.
+I've got `require!(shares > 0, ZeroShares)` in there. That turns "you lose your money"
+into "your transaction fails and you keep your money", which is the part that matters.
 
-`require!(shares > 0, ZeroShares)` is in the code. It turns "you lose your money" into
-"your transaction fails and you keep your money." That's the part worth having.
+The proper fix is virtual shares, same idea as ERC-4626. It works, but it sticks a magic
+number in the middle of the share math and makes it harder to read, so I left it out and
+wrote it down here instead.
 
-The full fix is a virtual share offset (what ERC-4626 does with `_decimalsOffset`), or
-minting a small batch of dead shares on the first deposit. Both work. Both add a magic
-constant to the share math that makes it harder to read, and this is a teaching build,
-so it's documented here instead of implemented.
+Side effect of pricing off live balances: anyone sending tokens to the vault raises the
+share price for everyone. Not a bug. That's how a market can pay yield without needing
+another instruction.
 
-Related: because share price is read off live balances, anyone sending tokens to the
-vault raises the price for everyone. That's not a bug, it's the mechanism that lets a
-market pay yield with a plain transfer and no extra instruction.
+### Left out on purpose
 
-### What's deliberately not here
-
-| Left out | Why |
-|---|---|
-| Oracle / position pricing | Position tokens are par, so total assets is just a sum |
-| A real DeFi integration | Would bury the vault logic this is meant to show |
-| Management or performance fees | Extra surface area, teaches nothing new here |
-| Virtual shares | Documented above, `require!(shares > 0)` covers the damage |
-| Withdrawal queue or cooldown | The whole point is exit anytime, a queue contradicts that |
-| Pause switch | A pause is custodial by definition, it would make the headline false |
+No oracle, since position tokens are par and total assets is just addition. No real DeFi
+integration, it would bury the vault logic this is supposed to show. No fees. No
+withdrawal queue or cooldown, because the assignment says exit anytime and a queue is
+the opposite of that. No pause switch, because a pause is custodial by definition and
+would make this whole section a lie.
 
 ---
 
 ## Tests
 
-```
-anchor test --validator legacy
-```
+**vault (7):** initialize, deposit, withdraw, someone else tries to withdraw and fails,
+withdraw down to exactly rent exempt, one lamport past it fails, close.
 
-### vault (7)
+**nc-vault (8):** initialize, first deposit, invest everything so there's no cash left,
+alice gets out anyway and gets paid in position tokens, half and half vault splits pro
+rata, a plain transfer into the vault moves the share price, a deposit too small to earn
+a share fails, someone who isn't the manager tries to invest and fails.
 
-1. initialize, bumps get cached
-2. deposit, vault goes up by exactly the amount
-3. withdraw back to the owner
-4. someone else tries to withdraw → **fails**
-5. withdraw down to exactly rent-exempt → passes, this is the `>=` boundary
-6. one lamport past it → **fails** with `InsufficientFunds`
-7. close, state account gone, lamports returned
+That fourth nc-vault test is the whole extension. Everything else is supporting it.
 
-### nc-vault (8)
+Five of the 15 pass by failing. They're checking the program says no to something. A
+green check there means it said no.
 
-1. initialize, empty vault, zero shares
-2. first deposit, one share per token
-3. invest everything, vault cash hits zero
-4. **alice exits anyway and gets paid in position tokens** — this is the whole extension
-5. half cash half position, partial withdraw gets a slice of both
-6. plain token transfer into the vault raises the share price
-7. deposit too small to earn a share → **fails** with `ZeroShares`
-8. someone who isn't the manager tries to invest → **fails**
+---
 
-Four of these tests pass by failing. Tests 4, 6, 7 in the vault list and 7, 8 in the
-nc-vault list are checking that the program rejects something. A green check on those
-means the rejection worked.
+## Two things that ate my afternoon
 
-## Notes on Anchor 1.0
-
-Two things that cost real time here and aren't in older tutorials:
-
-**`CpiContext::new` takes a `Pubkey` now, not an `AccountInfo`.** Every 0.3x snippet you
-copy will fail to compile:
+`CpiContext::new` wants a `Pubkey` in Anchor 1.x, not an `AccountInfo`. Every example I
+found is written for 0.3x so nothing compiles until you swap it:
 
 ```rust
-CpiContext::new(self.token_program.to_account_info(), accounts)  // 0.3x
+CpiContext::new(self.token_program.to_account_info(), accounts)  // old
 CpiContext::new(self.token_program.key(), accounts)              // 1.x
 ```
 
-**`anchor build -p <name>` creates a second `target/` inside the program folder** and
-generates a fresh keypair there, which then doesn't match `declare_id!`. Plain
-`anchor build` is fine. If you see a program ID mismatch out of nowhere, look for a
-stray `programs/<name>/target/`.
+`anchor build -p <name>` makes a whole second `target/` inside the program folder with a
+brand new keypair in it, and then that keypair doesn't match your `declare_id!`. I got a
+program ID mismatch out of nowhere and couldn't work out where the address was even
+coming from. Just use plain `anchor build`.
